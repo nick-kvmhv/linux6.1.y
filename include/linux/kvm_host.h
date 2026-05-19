@@ -45,6 +45,8 @@
 #include <asm/kvm_host.h>
 #include <linux/kvm_dirty_ring.h>
 
+#include <linux/tlbsplit.h>
+
 #ifndef KVM_MAX_VCPU_IDS
 #define KVM_MAX_VCPU_IDS KVM_MAX_VCPUS
 #endif
@@ -379,6 +381,7 @@ struct kvm_vcpu {
 	 */
 	struct kvm_memory_slot *last_used_slot;
 	u64 last_used_slot_gen;
+	struct kvm_tlbsplit_pervcpu split_pervcpu;
 };
 
 /*
@@ -709,6 +712,7 @@ struct kvm {
 	struct kvm_memslots __memslots[KVM_ADDRESS_SPACE_NUM][2];
 	/* The current active memslot set for each address space */
 	struct kvm_memslots __rcu *memslots[KVM_ADDRESS_SPACE_NUM];
+	struct kvm_splitpages *splitpages;
 	struct xarray vcpu_array;
 
 	/* Used to wait for completion of MMU notifiers.  */

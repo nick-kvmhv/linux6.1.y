@@ -51,6 +51,8 @@
 
 #include <trace/events/ipi.h>
 
+#include <linux/tlbsplit.h>
+
 #include "capabilities.h"
 #include "cpuid.h"
 #include "evmcs.h"
@@ -4456,6 +4458,11 @@ static u32 vmx_exec_control(struct vcpu_vmx *vmx)
 				CPU_BASED_MONITOR_EXITING);
 	if (kvm_hlt_in_guest(vmx->vcpu.kvm))
 		exec_control &= ~CPU_BASED_HLT_EXITING;
+	
+	/* splittlb: Force INVLPG exiting even when EPT is enabled to track unmaps */
+	if (enable_ept && vmx->vcpu.kvm->splitpages)
+		exec_control |= CPU_BASED_INVLPG_EXITING;
+		
 	return exec_control;
 }
 
@@ -5685,6 +5692,8 @@ static int handle_ept_violation(struct kvm_vcpu *vcpu)
 	unsigned long exit_qualification;
 	gpa_t gpa;
 	u64 error_code;
+	int splitresult;
+	int is_split_handled;
 
 	exit_qualification = vmx_get_exit_qual(vcpu);
 
@@ -5720,6 +5729,19 @@ static int handle_ept_violation(struct kvm_vcpu *vcpu)
 
 	vcpu->arch.exit_qualification = exit_qualification;
 
+	is_split_handled = split_tlb_handle_ept_violation(vcpu, gpa, exit_qualification, &splitresult);
+
+	if (vcpu->split_pervcpu.mtf_active) {
+		exec_controls_setbit(to_vmx(vcpu), CPU_BASED_MONITOR_TRAP_FLAG);
+	}
+
+	if (is_split_handled) {
+		if (splitresult == 0) {
+			printk_once(KERN_WARNING "handle_ept_violation: returning 0!\n");
+		}
+		return splitresult;
+	}
+
 	/*
 	 * Check that the GPA doesn't exceed physical memory limits, as that is
 	 * a guest page fault.  We have to emulate the instruction here, because
@@ -5746,6 +5768,12 @@ static int handle_ept_misconfig(struct kvm_vcpu *vcpu)
 	 * nGPA here instead of the required GPA.
 	 */
 	gpa = vmcs_read64(GUEST_PHYSICAL_ADDRESS);
+
+	if (split_tlb_findpage(vcpu->kvm, gpa)) {
+		printk_once(KERN_WARNING "handle_ept_misconfig: Split page! Emulating to avoid loop.\n");
+		return kvm_emulate_instruction(vcpu, 0);
+	}
+
 	if (!is_guest_mode(vcpu) &&
 	    !kvm_io_bus_write(vcpu, KVM_FAST_MMIO_BUS, gpa, 0, NULL)) {
 		trace_kvm_fast_mmio(gpa);
@@ -5879,6 +5907,11 @@ static int handle_pause(struct kvm_vcpu *vcpu)
 
 static int handle_monitor_trap(struct kvm_vcpu *vcpu)
 {
+	if (vcpu->split_pervcpu.mtf_active) {
+		exec_controls_clearbit(to_vmx(vcpu), CPU_BASED_MONITOR_TRAP_FLAG);
+		return split_tlb_handle_mtf(vcpu);
+	}
+
 	return 1;
 }
 
@@ -6041,6 +6074,14 @@ static int handle_notify(struct kvm_vcpu *vcpu)
 	return 1;
 }
 
+static int handle_vmcall(struct kvm_vcpu *vcpu)
+{
+	if (split_tlb_vmcall_dispatch(vcpu)) {
+		return 1;
+	}
+	return kvm_emulate_hypercall(vcpu);
+}
+
 /*
  * The exit handlers return 1 if the exit was handled fully and guest execution
  * may resume.  Otherwise they set the kvm_run parameter to indicate what needs
@@ -6062,7 +6103,7 @@ static int (*kvm_vmx_exit_handlers[])(struct kvm_vcpu *vcpu) = {
 	[EXIT_REASON_INVD]		      = kvm_emulate_invd,
 	[EXIT_REASON_INVLPG]		      = handle_invlpg,
 	[EXIT_REASON_RDPMC]                   = kvm_emulate_rdpmc,
-	[EXIT_REASON_VMCALL]                  = kvm_emulate_hypercall,
+	[EXIT_REASON_VMCALL]                  = handle_vmcall,
 	[EXIT_REASON_VMCLEAR]		      = handle_vmx_instruction,
 	[EXIT_REASON_VMLAUNCH]		      = handle_vmx_instruction,
 	[EXIT_REASON_VMPTRLD]		      = handle_vmx_instruction,
@@ -7364,6 +7405,10 @@ static fastpath_t vmx_vcpu_run(struct kvm_vcpu *vcpu, u64 run_flags)
 	vmx->exit_reason.full = vmcs_read32(VM_EXIT_REASON);
 	if (unlikely((u16)vmx->exit_reason.basic == EXIT_REASON_MCE_DURING_VMENTRY))
 		kvm_machine_check();
+
+	if (split_tlb_findpage(vcpu->kvm, vmcs_read64(GUEST_PHYSICAL_ADDRESS))) {
+		printk_once(KERN_WARNING "vmx_handle_exit: Split page!\n");
+	}
 
 	if (likely(!vmx->exit_reason.failed_vmentry))
 		vmx->idt_vectoring_info = vmcs_read32(IDT_VECTORING_INFO_FIELD);

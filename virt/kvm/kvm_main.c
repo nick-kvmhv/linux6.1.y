@@ -575,6 +575,34 @@ static void kvm_null_fn(void)
 	     node;							     \
 	     node = interval_tree_iter_next(node, start, last))	     \
 
+int kvm_is_my_range(struct kvm *kvm, unsigned long start, unsigned long end)
+{
+	struct kvm_memslots *slots;
+	struct kvm_memory_slot *memslot;
+	int ret = 0;
+	int i, bkt;
+
+	for (i = 0; i < KVM_ADDRESS_SPACE_NUM; i++) {
+		slots = __kvm_memslots(kvm, i);
+		kvm_for_each_memslot(memslot, bkt, slots) {
+			unsigned long hva_start, hva_end;
+
+			hva_start = max(start, memslot->userspace_addr);
+			hva_end = min(end, memslot->userspace_addr +
+				      (memslot->npages << PAGE_SHIFT));
+			if (hva_start >= hva_end)
+				continue;
+			/*
+			 * {gfn(page) | page intersects with [hva_start, hva_end)} =
+			 * {gfn_start, gfn_start+1, ..., gfn_end-1}.
+			 */
+			ret = 1;
+		}
+	}
+
+	return ret;
+}
+
 static __always_inline int __kvm_handle_hva_range(struct kvm *kvm,
 						  const struct kvm_hva_range *range)
 {
@@ -1208,6 +1236,9 @@ static struct kvm *kvm_create_vm(unsigned long type, const char *fdname)
 
 		rcu_assign_pointer(kvm->memslots[i], &kvm->__memslots[i][0]);
 	}
+
+	if (!tlb_split_init(kvm))
+		goto out_err_no_srcu;
 
 	for (i = 0; i < KVM_NR_BUSES; i++) {
 		rcu_assign_pointer(kvm->buses[i],
@@ -5770,6 +5801,7 @@ static void kvm_init_debug(void)
 				kvm_debugfs_dir,
 				(void *)(long)pdesc->desc.offset, fops);
 	}
+	split_init_debugfs();
 }
 
 static int kvm_suspend(void)
@@ -6031,6 +6063,7 @@ EXPORT_SYMBOL_GPL(kvm_init);
 
 void kvm_exit(void)
 {
+	split_shutdown_debugfs();
 	int cpu;
 
 	/*

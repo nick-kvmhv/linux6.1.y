@@ -242,6 +242,10 @@ int kvm_arch_write_log_dirty(struct kvm_vcpu *vcpu);
 int kvm_mmu_post_init_vm(struct kvm *kvm);
 void kvm_mmu_pre_destroy_vm(struct kvm *kvm);
 
+u64* split_tlb_findspte(struct kvm_vcpu *vcpu,gfn_t gfn,int callback(u64* sptep, int level, int last, int large)); //splittlb
+void kvm_mmu_gfn_disallow_lpage(const struct kvm_memory_slot *slot, gfn_t gfn);
+void kvm_mmu_gfn_allow_lpage(const struct kvm_memory_slot *slot, gfn_t gfn);
+
 static inline bool kvm_shadow_root_allocated(struct kvm *kvm)
 {
 	/*

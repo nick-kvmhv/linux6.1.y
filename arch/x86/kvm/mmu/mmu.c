@@ -2384,6 +2384,11 @@ static int mmu_page_zap_pte(struct kvm *kvm, struct kvm_mmu_page *sp,
 	u64 pte;
 	struct kvm_mmu_page *child;
 
+	if (COULD_BE_SPLIT_PAGE(*spte) && split_tlb_has_split_page(kvm, spte)) {
+		printk(KERN_INFO "mmu_page_zap_pte: zapping split page, restored it to 0x%llx vm:%x\n",
+		       *spte, kvm->splitpages->vmcounter);
+	}
+
 	pte = *spte;
 	if (is_shadow_present_pte(pte)) {
 		if (is_last_spte(pte, sp->role.level)) {
@@ -2805,6 +2810,9 @@ static int mmu_set_spte(struct kvm_vcpu *vcpu, struct kvm_memory_slot *slot,
 	bool flush = false;
 	bool wrprot;
 	u64 spte;
+	struct kvm_splitpage *page;
+
+	page = split_tlb_findpage(vcpu->kvm, gfn << PAGE_SHIFT);
 
 	/* Prefetching always gets a writable pfn.  */
 	bool host_writable = !fault || fault->map_writable;
@@ -2846,6 +2854,18 @@ static int mmu_set_spte(struct kvm_vcpu *vcpu, struct kvm_memory_slot *slot,
 
 	wrprot = make_spte(vcpu, sp, slot, pte_access, gfn, pfn, *sptep, prefetch,
 			   true, host_writable, &spte);
+
+	if (page) {
+		if (page->active) {
+			printk(KERN_INFO "set_spte: adjusting active spte to Read-Only and saving it on the page descriptor :0x%llx vm:%x\n", spte, vcpu->kvm->splitpages->vmcounter);
+		} else {
+			printk(KERN_INFO "set_spte: Zap recovery applying Double-Fault sabotage for GPA 0x%llx, native spte: 0x%llx vm:%x\n",
+			       (u64)(gfn << PAGE_SHIFT), spte, vcpu->kvm->splitpages->vmcounter);
+			page->active = true;
+		}
+		page->original_spte = spte;
+		spte &= ~(VMX_EPT_WRITABLE_MASK | VMX_EPT_EXECUTABLE_MASK); /* Leave READ intact! */
+	}
 
 	if (*sptep == spte) {
 		ret = RET_PF_SPURIOUS;
@@ -5667,6 +5687,8 @@ void kvm_mmu_invalidate_gva(struct kvm_vcpu *vcpu, struct kvm_mmu *mmu,
 
 void kvm_mmu_invlpg(struct kvm_vcpu *vcpu, gva_t gva)
 {
+	split_tlb_invlpg(vcpu, gva);
+
 	kvm_mmu_invalidate_gva(vcpu, vcpu->arch.walk_mmu, gva, INVALID_PAGE);
 	++vcpu->stat.invlpg;
 }
@@ -5678,6 +5700,8 @@ void kvm_mmu_invpcid_gva(struct kvm_vcpu *vcpu, gva_t gva, unsigned long pcid)
 	struct kvm_mmu *mmu = vcpu->arch.mmu;
 	bool tlb_flush = false;
 	uint i;
+
+	split_tlb_invlpg(vcpu, gva);
 
 	if (pcid == kvm_get_active_pcid(vcpu)) {
 		if (mmu->invlpg)
@@ -6102,6 +6126,25 @@ void kvm_zap_gfn_range(struct kvm *kvm, gfn_t gfn_start, gfn_t gfn_end)
 
 	write_unlock(&kvm->mmu_lock);
 }
+
+u64* split_tlb_findspte(struct kvm_vcpu *vcpu, gfn_t gfn, int callback(u64* sptep, int level, int last, int large))
+{
+	struct kvm_shadow_walk_iterator iterator;
+
+	for_each_shadow_entry(vcpu, gfn << PAGE_SHIFT, iterator) {
+		u64 spte = iterator.sptep ? split_tlb_safe_deref(iterator.sptep) : 0;
+		if (spte == 0)
+			break;
+		if (spte != 0) {
+			int last = is_last_spte(spte, iterator.level);
+			int large = is_large_pte(spte);
+			if (callback(iterator.sptep, iterator.level, last, large))
+				return iterator.sptep;
+		}
+	}
+	return NULL;
+}
+EXPORT_SYMBOL_GPL(split_tlb_findspte);
 
 static bool slot_rmap_write_protect(struct kvm *kvm,
 				    struct kvm_rmap_head *rmap_head,

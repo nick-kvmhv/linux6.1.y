@@ -52,6 +52,7 @@
 #include <linux/timekeeper_internal.h>
 #include <linux/pvclock_gtod.h>
 #include <linux/kvm_irqfd.h>
+#include <linux/tlbsplit.h>
 #include <linux/irqbypass.h>
 #include <linux/sched/stat.h>
 #include <linux/sched/isolation.h>
@@ -1280,6 +1281,8 @@ int kvm_set_cr3(struct kvm_vcpu *vcpu, unsigned long cr3)
 	unsigned long pcid = 0;
 #ifdef CONFIG_X86_64
 	bool pcid_enabled = kvm_read_cr4_bits(vcpu, X86_CR4_PCIDE);
+
+	split_tlb_flush_all(vcpu);
 
 	if (pcid_enabled) {
 		skip_tlb_flush = cr3 & X86_CR3_PCID_NOFLUSH;
@@ -8895,6 +8898,7 @@ int x86_decode_emulated_instruction(struct kvm_vcpu *vcpu, int emulation_type,
 }
 EXPORT_SYMBOL_GPL(x86_decode_emulated_instruction);
 
+
 int x86_emulate_instruction(struct kvm_vcpu *vcpu, gpa_t cr2_or_gpa,
 			    int emulation_type, void *insn, int insn_len)
 {
@@ -8988,6 +8992,8 @@ int x86_emulate_instruction(struct kvm_vcpu *vcpu, gpa_t cr2_or_gpa,
 		emulator_invalidate_register_cache(ctxt);
 	}
 
+	tlbsplit_emulation_log("tblsemul:pos1");
+
 restart:
 	if (emulation_type & EMULTYPE_PF) {
 		/* Save the faulting GPA (cr2) in the address field */
@@ -9011,6 +9017,8 @@ restart:
 	 */
 	r = x86_emulate_insn(ctxt, is_guest_mode(vcpu) &&
 				   !(emulation_type & EMULTYPE_NO_DECODE));
+
+	tlbsplit_emulation_log("tblsemul:pos2 r=%d",r);
 
 	if (r == EMULATION_INTERCEPTED)
 		return 1;
@@ -12713,6 +12721,10 @@ void kvm_arch_destroy_vm(struct kvm *kvm)
 	kvm_destroy_vcpus(kvm);
 	kvfree(rcu_dereference_check(kvm->arch.apic_map, 1));
 	kfree(srcu_dereference_check(kvm->arch.pmu_event_filter, &kvm->srcu, 1));
+
+	/* Clean up split pages while SRCU and Memslots are still active */
+	kvm_split_tlb_deactivateall(kvm);
+
 	kvm_mmu_uninit_vm(kvm);
 	kvm_page_track_cleanup(kvm);
 	kvm_xen_destroy_vm(kvm);
@@ -13623,6 +13635,8 @@ int kvm_handle_invpcid(struct kvm_vcpu *vcpu, unsigned long type, gva_t gva)
 		return kvm_skip_emulated_instruction(vcpu);
 
 	case INVPCID_TYPE_SINGLE_CTXT:
+		split_tlb_flush_all(vcpu);
+
 		if (!pcid_enabled && (operand.pcid != 0)) {
 			kvm_inject_gp(vcpu, 0);
 			return 1;
@@ -13641,6 +13655,8 @@ int kvm_handle_invpcid(struct kvm_vcpu *vcpu, unsigned long type, gva_t gva)
 
 		fallthrough;
 	case INVPCID_TYPE_ALL_INCL_GLOBAL:
+		split_tlb_flush_all(vcpu);
+
 		kvm_make_request(KVM_REQ_TLB_FLUSH_GUEST, vcpu);
 		return kvm_skip_emulated_instruction(vcpu);
 
