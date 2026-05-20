@@ -1282,8 +1282,6 @@ int kvm_set_cr3(struct kvm_vcpu *vcpu, unsigned long cr3)
 #ifdef CONFIG_X86_64
 	bool pcid_enabled = kvm_read_cr4_bits(vcpu, X86_CR4_PCIDE);
 
-	split_tlb_flush_all(vcpu);
-
 	if (pcid_enabled) {
 		skip_tlb_flush = cr3 & X86_CR3_PCID_NOFLUSH;
 		cr3 &= ~X86_CR3_PCID_NOFLUSH;
@@ -13635,7 +13633,7 @@ int kvm_handle_invpcid(struct kvm_vcpu *vcpu, unsigned long type, gva_t gva)
 		return kvm_skip_emulated_instruction(vcpu);
 
 	case INVPCID_TYPE_SINGLE_CTXT:
-		split_tlb_flush_all(vcpu);
+		split_tlb_invpcid_flush(vcpu, operand.pcid, false);
 
 		if (!pcid_enabled && (operand.pcid != 0)) {
 			kvm_inject_gp(vcpu, 0);
@@ -13655,7 +13653,7 @@ int kvm_handle_invpcid(struct kvm_vcpu *vcpu, unsigned long type, gva_t gva)
 
 		fallthrough;
 	case INVPCID_TYPE_ALL_INCL_GLOBAL:
-		split_tlb_flush_all(vcpu);
+		split_tlb_invpcid_flush(vcpu, 0, true);
 
 		kvm_make_request(KVM_REQ_TLB_FLUSH_GUEST, vcpu);
 		return kvm_skip_emulated_instruction(vcpu);

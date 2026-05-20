@@ -1574,19 +1574,11 @@ int split_tlb_handle_ept_violation(struct kvm_vcpu *vcpu,gpa_t gpa,unsigned long
 			int thrashed = 0; 
 			if (exit_on_same_addr) 
 			   thrashed =  vcpu->split_pervcpu.last_read_count + vcpu->split_pervcpu.last_exec_count;
-			/*else {
-				if (exit_qualification & PTE_READ) {
-					thrashed += vcpu->split_pervcpu.last_read_count;
-				}
-				if (exit_qualification & PTE_EXECUTE) {
-					thrashed += vcpu->split_pervcpu.last_exec_count;
-				}
-			}*/
 			if ( thrashed >= 4 ) {
-				/*if ( thrashed == 4 ) {
+				if ( thrashed == 4 ) {
 					printk(KERN_INFO "split_tlb_handle_ept_violation: thrashing detected at r0x%lx/x0x%lx qualification: 0x%lx",vcpu->split_pervcpu.last_read_rip,vcpu->split_pervcpu.last_exec_rip,exit_qualification);
 				//	kvm_flush_remote_tlbs(vcpu->kvm);
-				}*/
+				}
 				if (exit_qualification & PTE_READ) {
 					if ( ( exec_when_last_read == vcpu->split_pervcpu.last_exec_count ) || exit_on_same_addr ) 
 						emulate_now = 1;
@@ -1627,7 +1619,7 @@ int split_tlb_handle_ept_violation(struct kvm_vcpu *vcpu,gpa_t gpa,unsigned long
 							newspte |= splitpage->original_spte & PT64_BASE_ADDR_MASK;
 							*sptep = newspte;
 							kvm_flush_remote_tlbs(vcpu->kvm);
-							
+
 							vcpu->split_pervcpu.mtf_thrash_gpa = splitpage->gpa;
 							vcpu->split_pervcpu.mtf_active = true;
 						}

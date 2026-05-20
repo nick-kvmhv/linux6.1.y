@@ -4458,11 +4458,15 @@ static u32 vmx_exec_control(struct vcpu_vmx *vmx)
 				CPU_BASED_MONITOR_EXITING);
 	if (kvm_hlt_in_guest(vmx->vcpu.kvm))
 		exec_control &= ~CPU_BASED_HLT_EXITING;
-	
+
 	/* splittlb: Force INVLPG exiting even when EPT is enabled to track unmaps */
 	if (enable_ept && vmx->vcpu.kvm->splitpages)
 		exec_control |= CPU_BASED_INVLPG_EXITING;
-		
+
+	/* splittlb: Persist MTF if our engine armed it */
+	if (vmx->vcpu.split_pervcpu.mtf_active)
+		exec_control |= CPU_BASED_MONITOR_TRAP_FLAG;
+
 	return exec_control;
 }
 
@@ -6528,6 +6532,10 @@ static int __vmx_handle_exit(struct kvm_vcpu *vcpu, fastpath_t exit_fastpath)
 		}
 		vcpu->run->internal.data[ndata++] = vcpu->arch.last_vmentry_cpu;
 		vcpu->run->internal.ndata = ndata;
+
+		if (split_tlb_findpage(vcpu->kvm, vmcs_read64(GUEST_PHYSICAL_ADDRESS))) {
+			printk_once(KERN_WARNING "__vmx_handle_exit: Split page delivery error!\n");
+		}
 		return 0;
 	}
 
@@ -7405,10 +7413,6 @@ static fastpath_t vmx_vcpu_run(struct kvm_vcpu *vcpu, u64 run_flags)
 	vmx->exit_reason.full = vmcs_read32(VM_EXIT_REASON);
 	if (unlikely((u16)vmx->exit_reason.basic == EXIT_REASON_MCE_DURING_VMENTRY))
 		kvm_machine_check();
-
-	if (split_tlb_findpage(vcpu->kvm, vmcs_read64(GUEST_PHYSICAL_ADDRESS))) {
-		printk_once(KERN_WARNING "vmx_handle_exit: Split page!\n");
-	}
 
 	if (likely(!vmx->exit_reason.failed_vmentry))
 		vmx->idt_vectoring_info = vmcs_read32(IDT_VECTORING_INFO_FIELD);
