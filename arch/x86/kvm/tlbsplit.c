@@ -168,9 +168,6 @@ bool tlb_split_init(struct kvm *kvm) {
 		kvm->splitpages->vmcounter = next_vm++;
 		spin_lock_init(&kvm->splitpages->track_lock);
 
-		if (is_tdp_mmu_enabled(kvm))
-			printk(KERN_WARNING "split_tlb: WARNING! TDP MMU is ENABLED. The introspection engine requires the legacy shadow MMU. Please boot the host with kvm.tdp_mmu=0\n");
-
 		return true;
 	}
 	else
@@ -1224,6 +1221,8 @@ int split_tlb_vmcall_dispatch(struct kvm_vcpu *vcpu)
 		case 0x0000:
 			result = 1;
 			kvm_rax_write(vcpu, vcpu->kvm->splitpages->vmcounter);
+			if (is_tdp_mmu_enabled(vcpu->kvm))
+				printk_once(KERN_WARNING "split_tlb: WARNING! TDP MMU is ENABLED. The introspection engine requires the legacy shadow MMU. Please boot the host with kvm.tdp_mmu=0\n");
 			break;
 		case 0x0001:
 			result = split_tlb_setdatapage(vcpu,rbx,rbx,cr3);
