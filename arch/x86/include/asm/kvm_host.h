@@ -1413,6 +1413,10 @@ struct kvm_vcpu_stat {
 	u64 preemption_other;
 	u64 guest_mode;
 	u64 notify_window_exits;
+	/*tlb split*/
+	u64 split_page_flips;
+	u64 split_mtf_exits;
+	u64 split_thrashing;
 };
 
 struct x86_instruction_info;

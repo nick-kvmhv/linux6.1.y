@@ -1031,6 +1031,7 @@ int split_tlb_flip_page(struct kvm_vcpu *vcpu, gpa_t gpa, struct kvm_splitpage* 
 			vcpu->split_pervcpu.last_read_count = 0;
 			vcpu->split_pervcpu.flip_tick = now_tick;
 		}
+		vcpu->stat.split_page_flips++;
 	} else if (exit_qualification & PTE_EXECUTE) //execute
 	{
 		u64* sptep;
@@ -1070,6 +1071,7 @@ int split_tlb_flip_page(struct kvm_vcpu *vcpu, gpa_t gpa, struct kvm_splitpage* 
 			vcpu->split_pervcpu.last_exec_count = 0;
 			vcpu->split_pervcpu.flip_tick = now_tick;
 		}
+		vcpu->stat.split_page_flips++;
 	} else
 		printk(KERN_ERR "split_tlb_flip_page: unexpected EPT fault at gpa 0x%llx (gva 0x%lx) vm:%x\n",gpa, splitpage->gva, vcpu->kvm->splitpages->vmcounter);
 	return 1;
@@ -1427,6 +1429,8 @@ int split_tlb_handle_mtf(struct kvm_vcpu *vcpu)
 	if (!vcpu->split_pervcpu.mtf_active)
 		return 0; /* Not our MTF exit */
 
+	vcpu->stat.split_mtf_exits++;
+
 	vcpu->split_pervcpu.mtf_active = false;
 	
 	/* (VMX handler will clear the CPU_BASED_MONITOR_TRAP_FLAG before calling this) */
@@ -1575,10 +1579,11 @@ int split_tlb_handle_ept_violation(struct kvm_vcpu *vcpu,gpa_t gpa,unsigned long
 			if (exit_on_same_addr) 
 			   thrashed =  vcpu->split_pervcpu.last_read_count + vcpu->split_pervcpu.last_exec_count;
 			if ( thrashed >= 4 ) {
-				if ( thrashed == 4 ) {
-					printk(KERN_INFO "split_tlb_handle_ept_violation: thrashing detected at r0x%lx/x0x%lx qualification: 0x%lx",vcpu->split_pervcpu.last_read_rip,vcpu->split_pervcpu.last_exec_rip,exit_qualification);
+				vcpu->stat.split_thrashing++;
+				//if ( thrashed == 4 ) {
+				//	printk(KERN_INFO "split_tlb_handle_ept_violation: thrashing detected at r0x%lx/x0x%lx qualification: 0x%lx",vcpu->split_pervcpu.last_read_rip,vcpu->split_pervcpu.last_exec_rip,exit_qualification);
 				//	kvm_flush_remote_tlbs(vcpu->kvm);
-				}
+				//}
 				if (exit_qualification & PTE_READ) {
 					if ( ( exec_when_last_read == vcpu->split_pervcpu.last_exec_count ) || exit_on_same_addr ) 
 						emulate_now = 1;
