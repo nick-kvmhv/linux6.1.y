@@ -70,7 +70,7 @@ struct kvm_splitpages {
 
 
 bool tlb_split_init(struct kvm *kvm);
-void kvm_split_tlb_freepage(struct kvm *kvm, struct kvm_splitpage *page);
+void kvm_split_tlb_freepage(struct kvm *kvm, struct kvm_splitpage *page, bool log_destruction);
 void kvm_split_tlb_deactivateall(struct kvm *kvm);
 void split_init_debugfs(void);
 void split_shutdown_debugfs(void);

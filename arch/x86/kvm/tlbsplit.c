@@ -174,9 +174,10 @@ bool tlb_split_init(struct kvm *kvm) {
 		return false;
 }
 
-void kvm_split_tlb_freepage(struct kvm *kvm, struct kvm_splitpage *page)
+void kvm_split_tlb_freepage(struct kvm *kvm, struct kvm_splitpage *page, bool log_destruction)
 {
 	gpa_t old_gpa = 0;
+	gva_t old_gva = 0;
 	void *code;
 	split_tlb_unprotect_pte(kvm, page);
 	/* Drop the THP restriction if this page was ever activated */
@@ -185,6 +186,7 @@ void kvm_split_tlb_freepage(struct kvm *kvm, struct kvm_splitpage *page)
 		old_gpa = page->gpa;
 		page->gpa = 0;
 	}
+	old_gva = page->gva;
 	page->cr3 = 0;
 	page->pte_gpa = 0;
 	page->pte_gfn = 0;
@@ -197,6 +199,9 @@ void kvm_split_tlb_freepage(struct kvm *kvm, struct kvm_splitpage *page)
 	page->codeaddr = 0;
 	page->mtf_exits = 0;
 	spin_unlock(&kvm->splitpages->track_lock);
+
+	if (old_gva != 0 && log_destruction)
+		printk(KERN_INFO "split_tlb: Hook destroyed for GVA 0x%lx vm:%x\n", old_gva, kvm->splitpages->vmcounter);
 
 	if (old_gpa != 0)
 		split_tlb_allow_thp(kvm, old_gpa);
@@ -224,7 +229,7 @@ void kvm_split_tlb_deactivateall(struct kvm *kvm) {
 	}
 
 	for (i = 0; i < KVM_MAX_SPLIT_PAGES; i++)
-		kvm_split_tlb_freepage(kvm, &spages->pages[i]);
+		kvm_split_tlb_freepage(kvm, &spages->pages[i], false);
 	kfree(kvm->splitpages);
 }
 EXPORT_SYMBOL_GPL(kvm_split_tlb_deactivateall);
@@ -258,8 +263,10 @@ EXPORT_SYMBOL_GPL(split_tlb_findpage);
 
 struct kvm_splitpage* split_tlb_findpage_gva_cr3(struct kvm *kvms, gva_t gva, ulong cr3) {
 	struct kvm_splitpage* found;
+	struct kvm_splitpage* ambiguous_match = NULL;
 	gva_t pagestart;
 	int i;
+	int gva_matches = 0;
 
 	if (!kvms->splitpages) {
 		printk(KERN_WARNING "split_tlb: splitpages is NULL in split_tlb_findpage_gva_cr3!\n");
@@ -269,10 +276,25 @@ struct kvm_splitpage* split_tlb_findpage_gva_cr3(struct kvm *kvms, gva_t gva, ul
 	pagestart = gva&PAGE_MASK;
 	for (i=0; i<KVM_MAX_SPLIT_PAGES; i++) {
 		found = kvms->splitpages->pages+i;
-		if (found->gva == pagestart &&
-		    (found->cr3 & PT64_BASE_ADDR_MASK) == (cr3 & PT64_BASE_ADDR_MASK))
-			return found;
+		if (found->gva == pagestart) {
+			gva_matches++;
+			ambiguous_match = found;
+			if ((found->cr3 & PT64_BASE_ADDR_MASK) == (cr3 & PT64_BASE_ADDR_MASK))
+				return found;
+		}
 	}
+
+	/* If CR3 drifted (e.g. KVA shadow) but the GVA is unique across all hooks, it's ours! */
+	if (gva_matches == 1) {
+		if (ambiguous_match->cr3 != 0) {
+			printk(KERN_INFO "split_tlb: Recovered drifted CR3 for GVA 0x%lx (0x%lx -> 0x%lx) vm:%x\n",
+			       ambiguous_match->gva, ambiguous_match->cr3, cr3, kvms->splitpages->vmcounter);
+		}
+		/* Update the drifted CR3 so background evaluators don't fail on future TLB flushes */
+		ambiguous_match->cr3 = cr3;
+		return ambiguous_match;
+	}
+
 	return NULL;
 }
 
@@ -674,7 +696,7 @@ int split_tlb_freepage_by_gpa(struct kvm_vcpu *vcpu, gpa_t gpa) {
 	}
 	spin_unlock(&vcpu->kvm->splitpages->track_lock);
 
-	kvm_split_tlb_freepage(vcpu->kvm, page);
+	kvm_split_tlb_freepage(vcpu->kvm, page, false);
 	return 1;
 }
 
@@ -985,7 +1007,7 @@ int split_tlb_flip_page(struct kvm_vcpu *vcpu, gpa_t gpa, struct kvm_splitpage* 
 		if (split_tlb_restore_spte(vcpu,gfn,splitpage)==0) {
 			return 0;
 		}
-		kvm_split_tlb_freepage(vcpu->kvm, splitpage);
+		kvm_split_tlb_freepage(vcpu->kvm, splitpage, true);
 		printk(KERN_WARNING "split_tlb_flip_page: WRITE EPT fault at 0x%llx, page removed vm:%x\n",gpa, vcpu->kvm->splitpages->vmcounter);
 	} else if (exit_qualification & PTE_READ) //read
 	{
@@ -1093,7 +1115,7 @@ int split_tlb_flush_all(struct kvm_vcpu *vcpu) {
 		if (gva) {
 			if (spages->pages[i].active && spages->pages[i].gpa)
 				split_tlb_restore_spte(vcpu, spages->pages[i].gpa >> PAGE_SHIFT, &spages->pages[i]);
-			kvm_split_tlb_freepage(vcpu->kvm, &spages->pages[i]);
+			kvm_split_tlb_freepage(vcpu->kvm, &spages->pages[i], false);
 		}
 	}
 	split_tlb_setadjuster(vcpu,0,0,0);
@@ -1112,13 +1134,18 @@ int isPageSplit(struct kvm_vcpu *vcpu, gva_t addr, ulong cr3) {
 	page = split_tlb_findpage_gva_cr3(vcpu->kvm, addr, cr3);
 	if (page != NULL) {
 		bool needs_healing = false;
-
-		if (page->gpa != (addr_gpa & PAGE_MASK)) {
+		
+		/* If the hook was soft-suspended by a zap, it needs healing. */
+		if (!page->active) {
+			printk(KERN_INFO "isPageSplit: auto-healing for inactive/suspended hook on gva=%lx vm:%x\n", addr, vcpu->kvm->splitpages->vmcounter);
+			needs_healing = true;
+		} else if (page->gpa != (addr_gpa & PAGE_MASK)) {
 			printk(KERN_INFO "isPageSplit: auto-healing for GPA relocation gva=%lx (old gpa=0x%llx, new gpa=0x%llx, active=%d) vm:%x\n",
 			       addr, page->gpa, addr_gpa & PAGE_MASK, page->active, vcpu->kvm->splitpages->vmcounter);
 			needs_healing = true;
 		} else {
 			u64 *sptep;
+
 			write_lock(&vcpu->kvm->mmu_lock);
 			sptep = split_tlb_findspte(vcpu, addr_gpa >> PAGE_SHIFT, split_tlb_findspte_callback);
 			if (sptep) {
@@ -1127,6 +1154,12 @@ int isPageSplit(struct kvm_vcpu *vcpu, gva_t addr, ulong cr3) {
 				if ((spte & (VMX_EPT_READABLE_MASK | VMX_EPT_WRITABLE_MASK | VMX_EPT_EXECUTABLE_MASK)) ==
 				    (VMX_EPT_READABLE_MASK | VMX_EPT_WRITABLE_MASK | VMX_EPT_EXECUTABLE_MASK)) {
 					printk(KERN_INFO "isPageSplit: auto-healing for bypassed EPT permissions on gva=%lx (native mapping found) vm:%x\n", addr, vcpu->kvm->splitpages->vmcounter);
+					needs_healing = true;
+				}
+			} else {
+				/* If the page is active but we can't find its SPTE, the MMU zapped an intermediate page. Heal it. */
+				if (page->active) {
+					printk(KERN_INFO "isPageSplit: auto-healing because SPTE not found for active hook gva=%lx vm:%x\n", addr, vcpu->kvm->splitpages->vmcounter);
 					needs_healing = true;
 				}
 			}
