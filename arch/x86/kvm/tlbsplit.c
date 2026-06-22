@@ -606,23 +606,12 @@ int split_tlb_restore_spte_atomic(struct kvm *kvms,gfn_t gfn,u64* sptep,hpa_t st
 	}
 }
 
-hpa_t ts_gfn_to_pfa(struct kvm_vcpu *vcpu,gfn_t gfn) {
-struct kvm_memory_slot *slot;
-bool async,writable;
-kvm_pfn_t pfn;
-
-	slot = kvm_vcpu_gfn_to_memslot(vcpu, gfn);
-	async = false;
-	pfn = __gfn_to_pfn_memslot(slot, gfn, false, &async, false, &writable, NULL);
-	WARN(async, "ts_gfn_to_pfn: unexpected async:%d vm:%x\n", async, vcpu->kvm->splitpages->vmcounter);
-	return pfn << PAGE_SHIFT;
-	
-}
-
 int split_tlb_restore_spte(struct kvm_vcpu *vcpu,gfn_t gfn,struct kvm_splitpage* page) {
 	int result;
 	u64* sptep;
-	hpa_t stepaddr = ts_gfn_to_pfa(vcpu,gfn) ;
+	/* Use the cached HPA from when KVM originally mapped it, avoiding GUP refcount leaks! */
+	hpa_t stepaddr = page->original_spte & PT64_BASE_ADDR_MASK;
+
 	write_lock(&vcpu->kvm->mmu_lock);
 	sptep = split_tlb_findspte(vcpu,gfn,split_tlb_findspte_callback);
 	if (page->active) {
