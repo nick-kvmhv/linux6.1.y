@@ -118,6 +118,7 @@ void split_shutdown_debugfs(void) {
 void split_tlb_unprotect_pte(struct kvm *kvm, struct kvm_splitpage *page)
 {
 	struct kvm_memory_slot *slot;
+	gfn_t pte_gfn;
 
 	spin_lock(&kvm->splitpages->track_lock);
 	if (!page->pte_tracking_active) {
@@ -125,14 +126,17 @@ void split_tlb_unprotect_pte(struct kvm *kvm, struct kvm_splitpage *page)
 		return;
 	}
 
-	slot = gfn_to_memslot(kvm, page->pte_gfn);
+	page->pte_tracking_active = false;
+	pte_gfn = page->pte_gfn;
+	spin_unlock(&kvm->splitpages->track_lock);
+
+	slot = gfn_to_memslot(kvm, pte_gfn);
 	if (slot) {
-		kvm_slot_page_track_remove_page(kvm, slot, page->pte_gfn, KVM_PAGE_TRACK_WRITE);
+		write_lock(&kvm->mmu_lock);
+		kvm_slot_page_track_remove_page(kvm, slot, pte_gfn, KVM_PAGE_TRACK_WRITE);
+		write_unlock(&kvm->mmu_lock);
 		//printk(KERN_INFO "split_tlb: PTE write-protection removed for PTE GPA: 0x%llx\n", page->pte_gpa);
 	}
-
-	page->pte_tracking_active = false;
-	spin_unlock(&kvm->splitpages->track_lock);
 }
 
 void split_tlb_protect_pte(struct kvm_vcpu *vcpu, struct kvm_splitpage *page, gpa_t pte_gpa)
@@ -155,10 +159,12 @@ void split_tlb_protect_pte(struct kvm_vcpu *vcpu, struct kvm_splitpage *page, gp
 	page->pte_gpa = pte_gpa;
 	page->pte_gfn = pte_gfn;
 	page->pte_tracking_active = true;
-
-	kvm_slot_page_track_add_page(vcpu->kvm, slot, pte_gfn, KVM_PAGE_TRACK_WRITE);
-	//printk(KERN_INFO "split_tlb: PTE write-protection activated for PTE GPA: 0x%llx\n", pte_gpa);
 	spin_unlock(&vcpu->kvm->splitpages->track_lock);
+
+	write_lock(&vcpu->kvm->mmu_lock);
+	kvm_slot_page_track_add_page(vcpu->kvm, slot, pte_gfn, KVM_PAGE_TRACK_WRITE);
+	write_unlock(&vcpu->kvm->mmu_lock);
+	//printk(KERN_INFO "split_tlb: PTE write-protection activated for PTE GPA: 0x%llx\n", pte_gpa);
 }
 EXPORT_SYMBOL_GPL(split_tlb_protect_pte);
 
@@ -615,7 +621,6 @@ int split_tlb_restore_spte(struct kvm_vcpu *vcpu,gfn_t gfn,struct kvm_splitpage*
 	write_lock(&vcpu->kvm->mmu_lock);
 	sptep = split_tlb_findspte(vcpu,gfn,split_tlb_findspte_callback);
 	if (page->active) {
-		page->active = false;
 		if (( page->original_spte & PT64_BASE_ADDR_MASK ) == 0) {
 			printk(KERN_WARNING "split_tlb_restore_spte: page faulted at 0, restoring it to zero and falling back:0%llx vm:%x\n", gfn<<PAGE_SHIFT, vcpu->kvm->splitpages->vmcounter);
 			if (sptep)
@@ -626,10 +631,12 @@ int split_tlb_restore_spte(struct kvm_vcpu *vcpu,gfn_t gfn,struct kvm_splitpage*
 //				spin_unlock(&vcpu->kvm->mmu_lock);
 				printk(KERN_WARNING "split_tlb_restore_spte: zero spte, falling back to default handler gpa:0%llx vm:%x\n", gfn<<PAGE_SHIFT, vcpu->kvm->splitpages->vmcounter);
 				result = 0;
+				page->active = false;
 				goto unlockexit;
 			}
 			result = split_tlb_restore_spte_atomic(vcpu->kvm,gfn,sptep,stepaddr);
 		}
+		page->active = false; /* Set false ONLY AFTER restoring the SPTE to RWX! */
 	} else {
 		printk(KERN_WARNING "split_tlb_restore_spte: hit inactive page gpa:0%llx vm:%x\n", gfn<<PAGE_SHIFT, vcpu->kvm->splitpages->vmcounter);
 		result = 1;
@@ -667,6 +674,9 @@ int split_tlb_flip_to_code(struct kvm *kvms,hpa_t hpa,u64* sptep) {
 int split_tlb_freepage_by_gpa(struct kvm_vcpu *vcpu, gpa_t gpa) {
 	gfn_t gfn;
 	struct kvm_splitpage* page;
+	bool was_active;
+	unsigned long cr3 = 0, gva = 0;
+	gpa_t page_gpa = 0;
 
 	spin_lock(&vcpu->kvm->splitpages->track_lock);
 	page = split_tlb_findpage_internal(vcpu->kvm, gpa);
@@ -676,14 +686,21 @@ int split_tlb_freepage_by_gpa(struct kvm_vcpu *vcpu, gpa_t gpa) {
 		return 0;
 	}
 
-	if (page->active) {
+	was_active = page->active;
+	if (was_active) {
+		cr3 = page->cr3;
+		gva = page->gva;
+		page_gpa = page->gpa;
+	}
+	spin_unlock(&vcpu->kvm->splitpages->track_lock);
+
+	if (was_active) {
 		gfn = gpa >> PAGE_SHIFT;
 		split_tlb_restore_spte(vcpu, gfn, page);
-		printk(KERN_INFO "split_tlb_freepage_by_gpa: deactivating cr3:0x%lx gva:0x%lx gpa:0x%llx vm:%x\n", page->cr3, page->gva, page->gpa, vcpu->kvm->splitpages->vmcounter);
+		printk(KERN_INFO "split_tlb_freepage_by_gpa: deactivating cr3:0x%lx gva:0x%lx gpa:0x%llx vm:%x\n", cr3, gva, page_gpa, vcpu->kvm->splitpages->vmcounter);
 	} else {
 		printk(KERN_WARNING "split_tlb_freepage_by_gpa: inactive page cr3:0x%lx gva:0x%lx gpa:0x%llx vm:%x\n", page->cr3, page->gva, page->gpa, vcpu->kvm->splitpages->vmcounter);
 	}
-	spin_unlock(&vcpu->kvm->splitpages->track_lock);
 
 	kvm_split_tlb_freepage(vcpu->kvm, page, false);
 	return 1;
@@ -1351,13 +1368,19 @@ static void split_tlb_evaluate_hook(struct kvm_vcpu *vcpu, int i)
 		spin_lock(&spages->track_lock);
 		if (spages->pages[i].active && spages->pages[i].gpa != 0) {
 			old_gpa = spages->pages[i].gpa;
-			spages->pages[i].gpa = 0;
 		}
 		spin_unlock(&spages->track_lock);
+
 		if (old_gpa != 0) {
 			printk(KERN_INFO "split_tlb: Hook for gva 0x%lx suspended via Flush (Unmapped) vm:%x\n", gva, vcpu->kvm->splitpages->vmcounter);
 			split_tlb_restore_spte(vcpu, old_gpa >> PAGE_SHIFT, &spages->pages[i]);
 			split_tlb_allow_thp(vcpu->kvm, old_gpa);
+
+			/* Now it's safely restored to RWX. We can drop the GPA anchor. */
+			spin_lock(&spages->track_lock);
+			if (spages->pages[i].gpa == old_gpa)
+				spages->pages[i].gpa = 0;
+			spin_unlock(&spages->track_lock);
 
 			/* If we had a tripwire on the old page table, remove it since it's dead */
 			if (spages->pages[i].pte_tracking_active)
