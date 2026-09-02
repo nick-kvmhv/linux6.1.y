@@ -639,7 +639,7 @@ int split_tlb_restore_spte(struct kvm_vcpu *vcpu,gfn_t gfn,struct kvm_splitpage*
 		page->active = false; /* Set false ONLY AFTER restoring the SPTE to RWX! */
 	} else {
 		printk(KERN_WARNING "split_tlb_restore_spte: hit inactive page gpa:0%llx vm:%x\n", gfn<<PAGE_SHIFT, vcpu->kvm->splitpages->vmcounter);
-		result = 1;
+		result = 0;
 	}
 	
 unlockexit:	
@@ -1373,8 +1373,8 @@ static void split_tlb_evaluate_hook(struct kvm_vcpu *vcpu, int i)
 
 		if (old_gpa != 0) {
 			printk(KERN_INFO "split_tlb: Hook for gva 0x%lx suspended via Flush (Unmapped) vm:%x\n", gva, vcpu->kvm->splitpages->vmcounter);
-			split_tlb_restore_spte(vcpu, old_gpa >> PAGE_SHIFT, &spages->pages[i]);
-			split_tlb_allow_thp(vcpu->kvm, old_gpa);
+			if (split_tlb_restore_spte(vcpu, old_gpa >> PAGE_SHIFT, &spages->pages[i]))
+				split_tlb_allow_thp(vcpu->kvm, old_gpa);
 
 			/* Now it's safely restored to RWX. We can drop the GPA anchor. */
 			spin_lock(&spages->track_lock);
@@ -1532,8 +1532,8 @@ int split_tlb_handle_mtf(struct kvm_vcpu *vcpu)
 
 					if (old_gpa != 0) {
 						printk(KERN_INFO "split_tlb: Hook for gva 0x%lx suspended (Page unmapped via MTF natively) vm:%x\n", spages->pages[i].gva, vcpu->kvm->splitpages->vmcounter);
-						split_tlb_restore_spte(vcpu, old_gpa >> PAGE_SHIFT, &spages->pages[i]);
-						split_tlb_allow_thp(vcpu->kvm, old_gpa);
+						if (split_tlb_restore_spte(vcpu, old_gpa >> PAGE_SHIFT, &spages->pages[i]))
+							split_tlb_allow_thp(vcpu->kvm, old_gpa);
 					}
 				} else {
 					u64 new_gpa = evaluated_pte & PT64_BASE_ADDR_MASK;
