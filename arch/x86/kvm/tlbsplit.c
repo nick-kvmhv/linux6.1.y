@@ -204,6 +204,7 @@ void kvm_split_tlb_freepage(struct kvm *kvm, struct kvm_splitpage *page, bool lo
 	page->gva = 0;
 	page->codeaddr = 0;
 	page->mtf_exits = 0;
+	page->unmapped_mtf_exits = 0;
 	spin_unlock(&kvm->splitpages->track_lock);
 
 	if (old_gva != 0 && log_destruction)
@@ -514,6 +515,7 @@ int split_tlb_activatepage(struct kvm_vcpu *vcpu, gva_t gva, ulong cr3) {
 			page->pte_gpa = pte_gpa;
 			page->pte_gfn = pte_gpa >> PAGE_SHIFT;
 			page->pte_tracking_active = false;
+			page->unmapped_mtf_exits = 0;
 		} else {
 			printk(KERN_WARNING "split_tlb: Failed to find guest PTE GPA for GVA: 0x%lx, PTE tracking NOT activated! vm:%x\n", gva, vcpu->kvm->splitpages->vmcounter);
 		}
@@ -986,7 +988,8 @@ int split_tlb_flip_page(struct kvm_vcpu *vcpu, gpa_t gpa, struct kvm_splitpage* 
 
 		if (page_recycled) {
 			gpa_t old_gpa = 0;
-			printk(KERN_INFO "split_tlb_flip_page: Physical page 0x%llx recycled by OS for gva 0x%lx. Suspending hook vm:%x\n", gpa, splitpage->gva, vcpu->kvm->splitpages->vmcounter);
+			printk(KERN_INFO "split_tlb_flip_page: Physical page 0x%llx recycled by OS for gva 0x%lx (PTE GPA: 0x%llx). Suspending hook vm:%x\n",
+			       gpa, splitpage->gva, splitpage->pte_gpa, vcpu->kvm->splitpages->vmcounter);
 			if (split_tlb_restore_spte(vcpu, gfn, splitpage) == 0)
 				return 0;
 			spin_lock(&vcpu->kvm->splitpages->track_lock);
@@ -997,6 +1000,8 @@ int split_tlb_flip_page(struct kvm_vcpu *vcpu, gpa_t gpa, struct kvm_splitpage* 
 			spin_unlock(&vcpu->kvm->splitpages->track_lock);
 			if (old_gpa != 0)
 				split_tlb_allow_thp(vcpu->kvm, old_gpa);
+			/* Reset circuit breaker counter and arm tripwire to catch rapid remapping */
+			splitpage->unmapped_mtf_exits = 0;
 			split_tlb_protect_pte(vcpu, splitpage, splitpage->pte_gpa);
 			return 1; /* Hardware will retry and use the restored SPTE natively */
 		}
@@ -1401,6 +1406,7 @@ static void split_tlb_evaluate_hook(struct kvm_vcpu *vcpu, int i)
 	} else {
 		spages->pages[i].gpa = exact_gpa;
 		spages->pages[i].active = true;
+		spages->pages[i].unmapped_mtf_exits = 0;
 		old_gpa = -1ULL;
 	}
 	spin_unlock(&spages->track_lock);
@@ -1520,8 +1526,8 @@ int split_tlb_handle_mtf(struct kvm_vcpu *vcpu)
 			if (!kvm_read_guest(vcpu->kvm, spages->pages[i].pte_gpa, &evaluated_pte, sizeof(evaluated_pte))) {
 				if (!(evaluated_pte & 1ULL /* PT_PRESENT_MASK */)) {
 					gpa_t old_gpa = 0;
-					/* 2. Still unmapped! Re-raise the EPT write-protection shield */
-					split_tlb_protect_pte(vcpu, &spages->pages[i], spages->pages[i].pte_gpa);
+
+					spages->pages[i].unmapped_mtf_exits++;
 
 					spin_lock(&spages->track_lock);
 					if (spages->pages[i].active && spages->pages[i].gpa != 0) {
@@ -1531,14 +1537,32 @@ int split_tlb_handle_mtf(struct kvm_vcpu *vcpu)
 					spin_unlock(&spages->track_lock);
 
 					if (old_gpa != 0) {
-						printk(KERN_INFO "split_tlb: Hook for gva 0x%lx suspended (Page unmapped via MTF natively) vm:%x\n", spages->pages[i].gva, vcpu->kvm->splitpages->vmcounter);
+						printk(KERN_INFO "split_tlb: Hook for gva 0x%lx (GPA: 0x%llx, PTE GPA: 0x%llx, raw PTE: 0x%llx) suspended (Page unmapped via MTF natively) vm:%x\n",
+						       spages->pages[i].gva, old_gpa, spages->pages[i].pte_gpa, evaluated_pte, vcpu->kvm->splitpages->vmcounter);
 						if (split_tlb_restore_spte(vcpu, old_gpa >> PAGE_SHIFT, &spages->pages[i]))
 							split_tlb_allow_thp(vcpu->kvm, old_gpa);
+					}
+
+					if (spages->pages[i].unmapped_mtf_exits <= KVM_SPLIT_UNMAPPED_MTF_LIMIT) {
+						/* Within limit: keep shield armed to catch rapid multi-instruction remap */
+						split_tlb_protect_pte(vcpu, &spages->pages[i], spages->pages[i].pte_gpa);
+					} else {
+						/* Circuit breaker tripped: drop protection to prevent MTF exit storm / VM freeze */
+						if (spages->pages[i].pte_tracking_active)
+							split_tlb_unprotect_pte(vcpu->kvm, &spages->pages[i]);
+
+						if (spages->pages[i].unmapped_mtf_exits == KVM_SPLIT_UNMAPPED_MTF_LIMIT + 1) {
+							printk(KERN_WARNING "split_tlb: Circuit breaker tripped for gva 0x%lx (PTE GPA: 0x%llx)! Dropping PT write-protection after %u unmapped exits to prevent VM freeze vm:%x\n",
+							       spages->pages[i].gva, spages->pages[i].pte_gpa, KVM_SPLIT_UNMAPPED_MTF_LIMIT, vcpu->kvm->splitpages->vmcounter);
+						}
 					}
 				} else {
 					u64 new_gpa = evaluated_pte & PT64_BASE_ADDR_MASK;
 					bool was_active;
 					gpa_t old_gpa = 0;
+
+					/* Reset unmapped circuit-breaker counter since PTE is present and valid */
+					spages->pages[i].unmapped_mtf_exits = 0;
 					
 					spin_lock(&spages->track_lock);
 					was_active = spages->pages[i].active;

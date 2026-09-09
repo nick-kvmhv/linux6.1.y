@@ -29,6 +29,7 @@ struct kvm_tlbsplit_pervcpu {
 #define KVM_MAX_SPLIT_PAGES 100
 #define MAX_PATCH_SIZE 1024
 #define KVM_SPLIT_PAGES_TRACKER_SIZE 0x10
+#define KVM_SPLIT_UNMAPPED_MTF_LIMIT 64
 
 struct kvm_ept_violation_tracker_entry {
 	u32 counter;
@@ -56,6 +57,7 @@ struct kvm_splitpage {
 		gfn_t pte_gfn;
 		bool pte_tracking_active;
 		u32 mtf_exits;
+		u32 unmapped_mtf_exits;
 };
 
 struct kvm_splitpages {
